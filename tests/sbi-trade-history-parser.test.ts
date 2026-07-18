@@ -31,6 +31,25 @@ describe('SBI trade history parser', () => {
       settlementAmountOrProfitLoss: '1000',
       settlementAmountOrProfitLossRaw: '1000',
     });
+    expect(result.rows[1]).toMatchObject({
+      securityCode: '0000',
+      market: '東証',
+      unitPrice: '1234.5',
+      feesOrExpenses: '100',
+      taxAmount: '20',
+      settlementAmountOrProfitLoss: '12345',
+    });
+    expect(result.rows[2]).toMatchObject({
+      securityCode: 'ABCD',
+      feesOrExpenses: null,
+      feesOrExpensesRaw: '--',
+      settlementAmountOrProfitLoss: null,
+      settlementAmountOrProfitLossRaw: '--',
+    });
+    expect(result.rows[4]).toMatchObject({
+      feesOrExpenses: '1000',
+      settlementAmountOrProfitLoss: '-2000',
+    });
   });
 
   it('handles quoted commas and newlines without shifting columns', () => {
@@ -71,4 +90,48 @@ describe('SBI trade history parser', () => {
       expect(String(error)).not.toContain(secret);
     }
   });
+
+  it('rejects invalid UTF-8 after a BOM instead of replacing bytes', () => {
+    const invalid = new Uint8Array([0xef, 0xbb, 0xbf, 0xc3, 0x28]);
+    expect(() => parseSbiTradeHistory(invalid)).toThrow('文字コード');
+  });
+
+  it('requires exact headers without surrounding whitespace', () => {
+    const padded = ' 約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益';
+    expect(() => parseSbiTradeHistory(new TextEncoder().encode(padded))).toThrow('14列の見出し');
+  });
+
+  it('rejects malformed numeric grouping and impossible calendar dates', () => {
+    const header = '約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益';
+    const malformedNumber = `${header}\n2000/01/01,合成,0000,東証,現物買,当日,特定,課税,"1,2,3",1000,--,--,2000/01/03,10000`;
+    const impossibleDate = `${header}\n2026/99/99,合成,0000,東証,現物買,当日,特定,課税,10,1000,--,--,2000/01/03,10000`;
+    expect(() => parseSbiTradeHistory(new TextEncoder().encode(malformedNumber))).toThrow('約定数量');
+    expect(() => parseSbiTradeHistory(new TextEncoder().encode(impossibleDate))).toThrow('約定日');
+  });
+
+  it('tracks physical line numbers across blank and quoted multiline records', () => {
+    const header = '約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益';
+    const csv = [
+      '',
+      '[安全なメタデータ]',
+      header,
+      '2000/01/01,"合成',
+      '銘柄",0000,東証,現物買,当日,特定,課税,10,1000,--,--,2000/01/03,10000',
+      '2000/01/02,合成,0000,東証,現物買,当日,特定,課税,INVALID,1000,--,--,2000/01/04,10000',
+    ].join('\n');
+    expect(() => parseSbiTradeHistory(new TextEncoder().encode(csv))).toThrow('6行目');
+  });
+
+  it('rejects blank data records and whitespace after closing quotes', () => {
+    const header = '約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益';
+    expect(() => parseSbiTradeHistory(new TextEncoder().encode(`${header}\n\n`))).toThrow('2行目');
+    expect(() => parseSbiTradeHistory(new TextEncoder().encode(`${header}\n2000/01/01,"合成" ,0000,東証,現物買,当日,特定,課税,10,1000,--,--,2000/01/03,10000`))).toThrow('引用符');
+  });
+
+  it('decodes doubled quotes in a quoted field', () => {
+    const header = '約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料/諸経費等,税額,受渡日,受渡金額/決済損益';
+    const csv = `${header}\n2000/01/01,"安全な""合成銘柄",0000,東証,現物買,当日,特定,課税,10,1000,--,--,2000/01/03,10000`;
+    expect(parseSbiTradeHistory(new TextEncoder().encode(csv)).rows[0].securityName).toBe('安全な"合成銘柄');
+  });
+
 });

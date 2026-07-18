@@ -49,10 +49,14 @@ function decodeSource(source: Uint8Array): {
   encoding: ParsedSbiTradeHistory['metadata']['encoding'];
 } {
   if (source[0] === 0xef && source[1] === 0xbb && source[2] === 0xbf) {
-    return {
-      text: new TextDecoder('utf-8').decode(source.subarray(3)),
-      encoding: 'utf-8-bom',
-    };
+    try {
+      return {
+        text: new TextDecoder('utf-8', { fatal: true }).decode(source.subarray(3)),
+        encoding: 'utf-8-bom',
+      };
+    } catch {
+      throw new Error('SBI約定履歴CSVの文字コードを認識できません');
+    }
   }
 
   try {
@@ -72,22 +76,35 @@ function decodeSource(source: Uint8Array): {
   }
 }
 
-function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
+interface CsvRecord {
+  values: string[];
+  lineNumber: number;
+}
+
+function parseCsv(text: string): CsvRecord[] {
+  const records: CsvRecord[] = [];
   let row: string[] = [];
   let field = '';
   let quoted = false;
   let closedQuote = false;
+  let physicalLine = 1;
+  let recordStartLine = 1;
 
   const finishField = () => {
     row.push(field);
     field = '';
     closedQuote = false;
   };
-  const finishRow = () => {
+  const finishRecord = () => {
     finishField();
-    rows.push(row);
+    records.push({ values: row, lineNumber: recordStartLine });
     row = [];
+  };
+  const consumeNewline = (textIndex: number): number => {
+    const character = text[textIndex];
+    const nextIndex = character === '\r' && text[textIndex + 1] === '\n' ? textIndex + 1 : textIndex;
+    physicalLine += 1;
+    return nextIndex;
   };
 
   for (let index = 0; index < text.length; index += 1) {
@@ -101,6 +118,9 @@ function parseCsv(text: string): string[][] {
           quoted = false;
           closedQuote = true;
         }
+      } else if (character === '\n' || character === '\r') {
+        field += '\n';
+        index = consumeNewline(index);
       } else {
         field += character;
       }
@@ -108,9 +128,10 @@ function parseCsv(text: string): string[][] {
       if (character === ',') {
         finishField();
       } else if (character === '\n' || character === '\r') {
-        if (character === '\r' && text[index + 1] === '\n') index += 1;
-        finishRow();
-      } else if (!/\s/.test(character)) {
+        finishRecord();
+        index = consumeNewline(index);
+        recordStartLine = physicalLine;
+      } else {
         throw new Error('SBI約定履歴CSVの引用符の後に不正な文字があります');
       }
     } else if (character === '"') {
@@ -121,22 +142,23 @@ function parseCsv(text: string): string[][] {
     } else if (character === ',') {
       finishField();
     } else if (character === '\n' || character === '\r') {
-      if (character === '\r' && text[index + 1] === '\n') index += 1;
-      finishRow();
+      finishRecord();
+      index = consumeNewline(index);
+      recordStartLine = physicalLine;
     } else {
       field += character;
     }
   }
 
   if (quoted) throw new Error('SBI約定履歴CSVに閉じていない引用符があります');
-  if (field.length > 0 || row.length > 0 || closedQuote) finishRow();
-  return rows.filter((candidate) => candidate.some((value) => value.length > 0));
+  if (field.length > 0 || row.length > 0 || closedQuote) finishRecord();
+  return records;
 }
 
 function isHeader(row: string[]): boolean {
   return (
     row.length === SBI_TRADE_HEADERS.length &&
-    SBI_TRADE_HEADERS.every((header, index) => row[index]?.trim() === header)
+    SBI_TRADE_HEADERS.every((header, index) => row[index] === header)
   );
 }
 
@@ -147,17 +169,31 @@ function nullableText(value: string): string | null {
 
 function normalizeDate(value: string, rowNumber: number, column: string): string {
   const match = /^(\d{4})\/(\d{2})\/(\d{2})$/.exec(value.trim());
-  if (!match) throw new Error(`SBI約定履歴CSVの${rowNumber}行目: ${column}の形式が不正です`);
-  return `${match[1]}-${match[2]}-${match[3]}`;
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (
+      date.getUTCFullYear() === year &&
+      date.getUTCMonth() === month - 1 &&
+      date.getUTCDate() === day
+    ) {
+      return `${match[1]}-${match[2]}-${match[3]}`;
+    }
+  }
+  throw new Error(`SBI約定履歴CSVの${rowNumber}行目: ${column}の形式が不正です`);
 }
 
 function normalizedDecimal(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed || trimmed === '-' || trimmed === '--') return null;
-  const parenthesized = /^\(([\d,]+(?:\.\d+)?)\)$/.exec(trimmed);
-  const candidate = parenthesized ? `-${parenthesized[1]}` : trimmed;
+  const parenthesized = /^\((.+)\)$/.exec(trimmed);
+  const candidate = parenthesized ? parenthesized[1] : trimmed;
+  const validGrouping = /^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$/.test(candidate);
+  if (!validGrouping) return null;
   const withoutSeparators = candidate.replaceAll(',', '');
-  return /^-?\d+(?:\.\d+)?$/.test(withoutSeparators) ? withoutSeparators : null;
+  return parenthesized ? `-${withoutSeparators}` : withoutSeparators.replace(/^\+/, '');
 }
 
 function requiredDecimal(value: string, rowNumber: number, column: string): string {
@@ -170,14 +206,18 @@ function requiredDecimal(value: string, rowNumber: number, column: string): stri
 
 export function parseSbiTradeHistory(source: Uint8Array): ParsedSbiTradeHistory {
   const decoded = decodeSource(source);
-  const csvRows = parseCsv(decoded.text);
-  const headerIndex = csvRows.findIndex(isHeader);
+  const csvRecords = parseCsv(decoded.text);
+  const headerIndex = csvRecords.findIndex((record) => isHeader(record.values));
   if (headerIndex < 0) {
     throw new Error('SBI約定履歴CSVに対応する14列の見出しがありません');
   }
 
-  const rows = csvRows.slice(headerIndex + 1).map((values, offset): SbiTradeHistoryRow => {
-    const sourceRowNumber = headerIndex + offset + 2;
+  const rows = csvRecords.slice(headerIndex + 1).map((record): SbiTradeHistoryRow => {
+    const sourceRowNumber = record.lineNumber;
+    const values = record.values;
+    if (values.every((value) => value.length === 0)) {
+      throw new Error(`SBI約定履歴CSVの${sourceRowNumber}行目: 空行は取り込めません`);
+    }
     if (values.length !== SBI_TRADE_HEADERS.length) {
       throw new Error(`SBI約定履歴CSVの${sourceRowNumber}行目: 列数が不正です`);
     }
@@ -207,7 +247,7 @@ export function parseSbiTradeHistory(source: Uint8Array): ParsedSbiTradeHistory 
   return {
     metadata: {
       encoding: decoded.encoding,
-      headerRowNumber: headerIndex + 1,
+      headerRowNumber: csvRecords[headerIndex].lineNumber,
     },
     rows,
   };
