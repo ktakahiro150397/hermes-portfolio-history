@@ -190,8 +190,10 @@ function normalizedDecimal(value: string): string | null {
   if (!trimmed || trimmed === '-' || trimmed === '--') return null;
   const parenthesized = /^\((.+)\)$/.exec(trimmed);
   const candidate = parenthesized ? parenthesized[1] : trimmed;
-  const validGrouping = /^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$/.test(candidate);
-  if (!validGrouping) return null;
+  const groupingPattern = parenthesized
+    ? /^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$/
+    : /^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$/;
+  if (!groupingPattern.test(candidate)) return null;
   const withoutSeparators = candidate.replaceAll(',', '');
   return parenthesized ? `-${withoutSeparators}` : withoutSeparators.replace(/^\+/, '');
 }
