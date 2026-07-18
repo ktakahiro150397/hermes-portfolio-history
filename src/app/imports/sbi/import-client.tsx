@@ -2,6 +2,10 @@
 
 import { useRef, useState, type ChangeEvent } from 'react';
 import { buildSbiImportPreview, type SbiImportPreview } from '@/import/sbi/import-preview';
+import {
+  assessSbiMarginHistory,
+  type SbiMarginHistoryAssessment,
+} from '@/import/sbi/margin-readiness';
 import { parseSbiTradeHistory } from '@/import/sbi/trade-history';
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -16,6 +20,7 @@ function safeErrorMessage(error: unknown) {
 export default function SbiImportClient() {
   const operationVersion = useRef(0);
   const [preview, setPreview] = useState<SbiImportPreview | null>(null);
+  const [marginAssessment, setMarginAssessment] = useState<SbiMarginHistoryAssessment | null>(null);
   const [status, setStatus] = useState<string>('');
   const [error, setError] = useState<string>('');
 
@@ -23,6 +28,7 @@ export default function SbiImportClient() {
     const version = ++operationVersion.current;
     const file = event.currentTarget.files?.[0];
     setPreview(null);
+    setMarginAssessment(null);
     setError('');
     setStatus('');
     if (!file) return;
@@ -36,8 +42,10 @@ export default function SbiImportClient() {
       if (version !== operationVersion.current) return;
       const parsed = parseSbiTradeHistory(new Uint8Array(buffer));
       const nextPreview = buildSbiImportPreview(parsed.rows);
+      const nextMarginAssessment = assessSbiMarginHistory(parsed.rows);
       if (version !== operationVersion.current) return;
       setPreview(nextPreview);
+      setMarginAssessment(nextMarginAssessment);
       setStatus(`取引 ${nextPreview.totalRows}件`);
     } catch (caught) {
       if (version !== operationVersion.current) return;
@@ -79,6 +87,32 @@ export default function SbiImportClient() {
               <strong>種類の確認待ち {preview.supportCounts['needs-review']}件</strong>
             </article>
           </div>
+          {marginAssessment && marginAssessment.marginRows > 0 ? (
+            <section className="margin-readiness" aria-labelledby="margin-readiness-title">
+              <h3 id="margin-readiness-title">信用取引の履歴確認</h3>
+              {marginAssessment.historyCoverage === 'needs-opening-position' ? (
+                <>
+                  <strong>開始時点の建玉情報が必要です</strong>
+                  <p>このCSVより前から続く建玉があるため、信用損益はまだ確定しません。</p>
+                </>
+              ) : marginAssessment.historyCoverage === 'needs-row-review' ? (
+                <>
+                  <strong>対応関係を確認できない信用取引があります</strong>
+                  <p>数量や銘柄は表示せず、確認が必要な状態だけを案内しています。</p>
+                </>
+              ) : marginAssessment.endingOpenPositions === 'present' ? (
+                <>
+                  <strong>CSV内の新規・返済関係を確認できました</strong>
+                  <p>末日時点に未決済の建玉があるため、現在残高との照合が必要です。</p>
+                </>
+              ) : (
+                <>
+                  <strong>CSV内の新規・返済関係を確認できました</strong>
+                  <p>末日時点の未決済建玉は、このCSV内では確認されませんでした。</p>
+                </>
+              )}
+            </section>
+          ) : null}
           {preview.totalRows === 0 ? (
             <div className="import-warning" role="alert">
               <strong>CSVに取引がありません</strong>

@@ -39,6 +39,15 @@ describe('SBI import client', () => {
     expect(screen.getByRole('button', { name: '取込を確定（まだ利用できません）' }).hasAttribute('disabled')).toBe(true);
   });
 
+  it('shows a privacy-safe margin history readiness result', async () => {
+    render(<SbiImportClient />);
+    choose(fileLike(csvBytes(['信用返済売'])));
+
+    expect(await screen.findByText('開始時点の建玉情報が必要です')).toBeTruthy();
+    expect(document.body.textContent).not.toContain('0000');
+    expect(document.body.textContent).not.toContain('[合成銘柄]');
+  });
+
   it('processes the repository-owned Shift_JIS fixture through the browser path', async () => {
     const bytes = new Uint8Array(await readFile(path.join(process.cwd(), 'tests/fixtures/sbi/trade-history.shift-jis.synthetic.csv')));
     render(<SbiImportClient />);
